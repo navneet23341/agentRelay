@@ -1,0 +1,33 @@
+{
+  "name": "agentrelay",
+  "version": "0.1.0",
+  "description": "A continuity layer for coding agents",
+  "main": "dist/src/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/src/server.js",
+    "migrate:up": "node-pg-migrate --envPath .env up",
+    "migrate:down": "node-pg-migrate --envPath .env down",
+    "migrate:create": "node-pg-migrate --envPath .env create",
+    "db:verify": "tsx scripts/verify-schema.ts",
+    "test:memory": "tsx scripts/test-memory-store.ts",
+    "test": "tsx scripts/verify-schema.ts && tsx scripts/test-memory-store.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-pg-migrate": "^7.9.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
