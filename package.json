@@ -13,12 +13,17 @@
     "migrate:create": "node-pg-migrate --envPath .env create",
     "db:verify": "tsx scripts/verify-schema.ts",
     "test:memory": "tsx scripts/test-memory-store.ts",
-    "test": "tsx scripts/verify-schema.ts && tsx scripts/test-memory-store.ts"
+    "test:lifecycle": "tsx scripts/test-lifecycle.ts",
+    "test:reliability": "tsx scripts/test-memory-reliability.ts",
+    "test:retrieval": "tsx scripts/test-retrieval.ts",
+    "test:compiler": "tsx scripts/test-context-compiler.ts",
+    "test": "tsx scripts/verify-schema.ts && tsx scripts/test-memory-store.ts && tsx scripts/test-lifecycle.ts && tsx scripts/test-memory-reliability.ts && tsx scripts/test-retrieval.ts && tsx scripts/test-context-compiler.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "js-tiktoken": "^1.0.21",
     "node-pg-migrate": "^7.9.0",
     "pg": "^8.13.1"
   },

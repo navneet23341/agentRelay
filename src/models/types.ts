@@ -2,6 +2,12 @@ export type MemoryType = 'DECISION' | 'FAILURE' | 'CHANGE' | 'OBSERVATION' | 'HA
 
 export type ConfidenceClass = 'OBSERVED' | 'INFERRED' | 'SUGGESTED';
 
+export const CONFIDENCE_CLASS_SCORES: Record<ConfidenceClass, number> = {
+  OBSERVED: 1.0,
+  INFERRED: 0.7,
+  SUGGESTED: 0.3,
+};
+
 export type MemoryStatus = 'ACTIVE' | 'SUPERSEDED' | 'INVALIDATED';
 
 export type TaskStatus =
@@ -58,6 +64,7 @@ export interface ITask {
   title: string;
   description: string | null;
   status: TaskStatus;
+  reopened_from: TaskStatus | null;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -111,9 +118,33 @@ export interface MemoryListFilters {
   taskId?: string;
   phaseId?: string;
   type?: MemoryType | MemoryType[];
-  status?: MemoryStatus | MemoryStatus[];
+  status?: MemoryStatus | MemoryStatus[] | 'ALL';
   limit?: number;
   offset?: number;
+}
+
+export interface CausalLineageOptions {
+  maxDepth?: number;
+  includeSelf?: boolean;
+}
+
+export interface IMemoryWithDepth extends IMemory {
+  depth: number;
+}
+
+export interface MemorySearchResult extends IMemory {
+  similarity_score: number;
+}
+
+export interface MemorySearchFilters extends MemoryListFilters {
+  limit?: number;
+  minSimilarity?: number;
+}
+
+export interface BackfillEmbeddingsResult {
+  processed: number;
+  updated: number;
+  failed: number;
 }
 
 export interface CreateMemoryResult {
@@ -124,4 +155,39 @@ export interface CreateMemoryResult {
 export interface SupersedeMemoryResult {
   oldMemory: IMemory;
   newMemory: IMemory;
+}
+
+export interface TaskListFilters {
+  projectId?: string;
+  phaseId?: string;
+  status?: TaskStatus | TaskStatus[];
+  reopened_from?: TaskStatus | TaskStatus[];
+  limit?: number;
+  offset?: number;
+}
+
+export interface PhaseListFilters {
+  projectId?: string;
+  status?: PhaseStatus | PhaseStatus[];
+}
+
+export interface SuggestTaskInput {
+  project_id: string;
+  phase_id?: string | null;
+  title: string;
+  description?: string | null;
+  reasoning?: string;
+}
+
+export interface ApproveSuggestionInput {
+  title?: string;
+  description?: string;
+  phase_id?: string;
+}
+
+export interface HandoffData {
+  completedItems: string[];
+  remainingItems: string[];
+  currentIssue?: string | null;
+  nextAction: string;
 }
