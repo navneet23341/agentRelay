@@ -1,12 +1,19 @@
+import { getEncoding, Tiktoken } from 'js-tiktoken';
 import { query } from '../config/database.js';
 import {
   IMemory,
   IMemoryWithDepth,
   MemoryType,
   TaskStatus,
+  IProject,
+  IPhase,
+  ITask,
 } from '../models/types.js';
+import { ProjectModel } from '../models/Project.js';
 import { TaskService } from './taskService.js';
+import { PhaseService } from './phaseService.js';
 import { MemoryService } from './memoryService.js';
+import { HandoffService } from './handoffService.js';
 
 export interface DecayConfig {
   lambdas: Record<MemoryType, number>;
@@ -200,12 +207,13 @@ export async function retrieveCandidateMemories(
   if (task.phase_id) {
     const sql = `
       WITH current_task_memories AS (
-        -- 1. All active memories created directly under the target task
+        -- 1. All active memories created directly under the target task (excluding HANDOFF)
         SELECT m.*, t.status AS task_status
         FROM memories m
         JOIN tasks t ON m.task_id = t.id
         WHERE m.status = 'ACTIVE'
           AND m.task_id = $1
+          AND m.type != 'HANDOFF'
       ),
       phase_decisions AS (
         -- 2. Enduring architectural decisions made across the current phase (unbounded)
@@ -259,13 +267,14 @@ export async function retrieveCandidateMemories(
       hit_count: Number(row.hit_count),
     }));
   } else {
-    // Unassigned phase: target task only
+    // Unassigned phase: target task only (excluding HANDOFF)
     const sql = `
       SELECT m.*, t.status AS task_status
       FROM memories m
       JOIN tasks t ON m.task_id = t.id
       WHERE m.status = 'ACTIVE'
         AND m.task_id = $1
+        AND m.type != 'HANDOFF'
       ORDER BY m.id, m.created_at DESC;
     `;
 
@@ -287,7 +296,9 @@ export async function retrieveCandidateMemories(
     });
 
     const existingIds = new Set(candidateRows.map((r) => r.id));
-    const newSemanticItems = semanticResults.filter((sr) => !existingIds.has(sr.id));
+    const newSemanticItems = semanticResults.filter(
+      (sr) => !existingIds.has(sr.id) && sr.type !== 'HANDOFF'
+    );
 
     if (newSemanticItems.length > 0) {
       const taskIdsToLookup = [
@@ -366,4 +377,331 @@ export async function retrieveCandidateMemories(
 
   return scoredMemories;
 }
+
+export interface PackedCandidate {
+  memory: ScoredMemory;
+  tokenCount: number;
+  rendered: string;
+}
+
+export interface SkippedCandidate {
+  memory: ScoredMemory;
+  tokenCount: number;
+  reason: string;
+}
+
+export interface PackingResult {
+  packed: PackedCandidate[];
+  skipped: SkippedCandidate[];
+  tokensUsed: number;
+  tokensRemaining: number;
+}
+
+/**
+ * Item 4 (Candidate Renderer & Causal Parent Deduplication):
+ * Renders a candidate memory into its final formatted string wrapper.
+ *
+ * Rules:
+ * 1. Wraps candidate: "- [TYPE] (Conf: X.XX): content"
+ * 2. If causal lineage is present:
+ *    - The first time a parent ID is encountered (not in alreadyRenderedParentIds),
+ *      renders full line: "\n  ↳ Caused by: [TYPE] (Conf: X.XX): content"
+ *    - On subsequent encounters (parent ID in alreadyRenderedParentIds),
+ *      renders terse reference: "\n  ↳ Caused by: [TYPE] (see above)"
+ *      to avoid duplicating content and wasting tokens.
+ */
+export function renderCandidateMemory(
+  memory: ScoredMemory,
+  alreadyRenderedParentIds?: ReadonlySet<string>
+): string {
+  const confFormatted = Number(memory.confidence_score).toFixed(2);
+  let rendered = `- [${memory.type}] (Conf: ${confFormatted}): ${memory.content}`;
+
+  if (memory.causal_lineage && memory.causal_lineage.length > 0) {
+    for (const parent of memory.causal_lineage) {
+      if (alreadyRenderedParentIds && alreadyRenderedParentIds.has(parent.id)) {
+        rendered += `\n  ↳ Caused by: [${parent.type}] (see above)`;
+      } else {
+        const parentConf = Number(parent.confidence_score).toFixed(2);
+        rendered += `\n  ↳ Caused by: [${parent.type}] (Conf: ${parentConf}): ${parent.content}`;
+      }
+    }
+  }
+
+  return rendered;
+}
+
+/**
+ * Item 4 (Greedy Token Packer):
+ * Packs candidate memories into the given token budget.
+ *
+ * Rules:
+ * 1. Input candidates must be pre-sorted by score DESC (retrieveCandidateMemories does this).
+ * 2. Token-counts full rendered string using js-tiktoken cl100k_base.
+ * 3. Does NOT halt on first candidate that doesn't fit; skips it and continues scanning
+ *    smaller lower-ranked candidates that fit in remaining budget.
+ * 4. Stops when all candidates have been scanned or remainingBudget <= 0.
+ * 5. Deduplicates shared causal parents across packed candidates, updating alreadyRenderedParentIds
+ *    only when a candidate is successfully packed (transactional).
+ */
+export function packCandidateMemories(
+  candidates: ScoredMemory[],
+  tokenBudget: number,
+  tokenizer?: Tiktoken
+): PackingResult {
+  const enc = tokenizer ?? getEncoding('cl100k_base');
+  const packed: PackedCandidate[] = [];
+  const skipped: SkippedCandidate[] = [];
+  const renderedParentIds = new Set<string>();
+  let remainingBudget = tokenBudget;
+
+  for (const candidate of candidates) {
+    if (remainingBudget <= 0) {
+      const rendered = renderCandidateMemory(candidate, renderedParentIds);
+      skipped.push({
+        memory: candidate,
+        tokenCount: enc.encode(rendered).length,
+        reason: 'Budget exhausted (0 tokens remaining)',
+      });
+      continue;
+    }
+
+    const rendered = renderCandidateMemory(candidate, renderedParentIds);
+    const tokenCount = enc.encode(rendered).length;
+
+    if (tokenCount <= remainingBudget) {
+      packed.push({
+        memory: candidate,
+        tokenCount,
+        rendered,
+      });
+      remainingBudget -= tokenCount;
+
+      // Commit causal parent IDs to rendered set
+      if (candidate.causal_lineage && candidate.causal_lineage.length > 0) {
+        for (const parent of candidate.causal_lineage) {
+          renderedParentIds.add(parent.id);
+        }
+      }
+    } else {
+      skipped.push({
+        memory: candidate,
+        tokenCount,
+        reason: `Exceeds remaining budget (${tokenCount} tokens > ${remainingBudget} remaining)`,
+      });
+    }
+  }
+
+  return {
+    packed,
+    skipped,
+    tokensUsed: tokenBudget - remainingBudget,
+    tokensRemaining: remainingBudget,
+  };
+}
+
+export interface RenderContextInput {
+  project: IProject;
+  phase: IPhase | null;
+  task: ITask;
+  packedMemories: PackedCandidate[];
+  latestHandoff: IMemory | null;
+}
+
+/**
+ * Item 5 (Block Formatter):
+ * Renders the compiled context into the standard HANDOFF-style block format:
+ * PROJECT / CURRENT PHASE / CURRENT TASK / RELEVANT DECISIONS / RELEVANT FAILURES / RECENT CHANGES / (RELEVANT OBSERVATIONS) / HANDOFF
+ */
+export function renderCompiledContext(input: RenderContextInput): string {
+  const { project, phase, task, packedMemories, latestHandoff } = input;
+
+  const sections: string[] = [];
+
+  // 1. PROJECT
+  const projectLines = [
+    `# PROJECT: ${project.name}`,
+    project.goal ? `Goal: ${project.goal}` : null,
+    project.constraints ? `Constraints: ${project.constraints}` : null,
+    project.repository_ref ? `Repository: ${project.repository_ref}` : null,
+  ].filter(Boolean);
+  sections.push(projectLines.join('\n'));
+
+  // 2. CURRENT PHASE
+  if (phase) {
+    const phaseLines = [
+      `## CURRENT PHASE: ${phase.name} [${phase.status}]`,
+      phase.description ? `Description: ${phase.description}` : null,
+    ].filter(Boolean);
+    sections.push(phaseLines.join('\n'));
+  } else {
+    sections.push(`## CURRENT PHASE: None (Unassigned)`);
+  }
+
+  // 3. CURRENT TASK
+  const taskLines = [
+    `## CURRENT TASK: ${task.title} [${task.status}]`,
+    task.description ? `Description: ${task.description}` : null,
+  ].filter(Boolean);
+  sections.push(taskLines.join('\n'));
+
+  // Group packed memories by type
+  const decisions = packedMemories.filter((p) => p.memory.type === 'DECISION');
+  const failures = packedMemories.filter((p) => p.memory.type === 'FAILURE');
+  const changes = packedMemories.filter((p) => p.memory.type === 'CHANGE');
+  const observations = packedMemories.filter((p) => p.memory.type === 'OBSERVATION');
+
+  // 4. RELEVANT DECISIONS
+  sections.push(
+    `## RELEVANT DECISIONS\n` +
+      (decisions.length > 0 ? decisions.map((d) => d.rendered).join('\n') : '_None_')
+  );
+
+  // 5. RELEVANT FAILURES
+  sections.push(
+    `## RELEVANT FAILURES\n` +
+      (failures.length > 0 ? failures.map((f) => f.rendered).join('\n') : '_None_')
+  );
+
+  // 6. RECENT CHANGES
+  sections.push(
+    `## RECENT CHANGES\n` +
+      (changes.length > 0 ? changes.map((c) => c.rendered).join('\n') : '_None_')
+  );
+
+  // RELEVANT OBSERVATIONS (if any)
+  if (observations.length > 0) {
+    sections.push(
+      `## RELEVANT OBSERVATIONS\n` +
+        observations.map((o) => o.rendered).join('\n')
+    );
+  }
+
+  // 7. HANDOFF (scoped strictly to current task)
+  sections.push(
+    `## HANDOFF\n` +
+      (latestHandoff ? latestHandoff.content : '_None (Initial task run)_')
+  );
+
+  return sections.join('\n\n');
+}
+
+export interface CompiledContextBudget {
+  totalBudget: number;
+  scaffoldingTokens: number;
+  scratchpadReserveTokens: number;
+  memoryBudget: number;
+  memoryTokensUsed: number;
+  memoryTokensRemaining: number;
+  totalOutputTokens: number;
+}
+
+export interface CompiledContextResult {
+  compiledText: string;
+  task: ITask;
+  phase: IPhase | null;
+  project: IProject;
+  latestHandoff: IMemory | null;
+  budget: CompiledContextBudget;
+  packedMemories: PackedCandidate[];
+  skippedMemories: SkippedCandidate[];
+}
+
+export interface CompiledContextOptions extends CompilerRetrievalOptions {
+  totalTokenBudget?: number;
+  scratchpadReserveRatio?: number;
+  tokenizer?: Tiktoken;
+}
+
+/**
+ * Item 5 (Context Compiler Entrypoint):
+ * Given a taskId, executes the complete end-to-end context compilation pipeline:
+ * 1. Lookups: Validates task, phase, project, and task-scoped latest handoff upfront
+ * 2. Scaffolding: Token-counts headers, section wrappers, and latest handoff upfront
+ * 3. Budget (Option a): Subtracts scaffolding from totalTokenBudget, then computes 80/20 split on available budget
+ * 4. Retrieval: Queries candidate memories (current task, phase decisions, phase changes, sibling failures, optional semantic; HANDOFF excluded)
+ * 5. Scoring: Scores each candidate (confidence × temporal decay × hit boost) and enriches 1-hop causal parents
+ * 6. Packing: Greedily packs candidates into memory budget using cl100k_base token counting,
+ *    skipping candidates that do not fit while continuing scan, and deduplicating shared causal parents
+ * 7. Rendering: Formats into the standardized multi-section context block and reports true total token count
+ */
+export async function getCompiledContext(
+  taskId: string,
+  options: CompiledContextOptions = {}
+): Promise<CompiledContextResult> {
+  const {
+    totalTokenBudget = 4000,
+    scratchpadReserveRatio = 0.20,
+    tokenizer = getEncoding('cl100k_base'),
+  } = options;
+
+  // 1. Fetch Task, Phase, Project, and Task-scoped Latest Handoff upfront before candidate retrieval
+  const task = await TaskService.getTaskById(taskId);
+  if (!task) {
+    throw new Error(`[getCompiledContext] Task with id "${taskId}" not found.`);
+  }
+
+  const project = await ProjectModel.findById(task.project_id);
+  if (!project) {
+    throw new Error(
+      `[getCompiledContext] Project with id "${task.project_id}" for task "${taskId}" not found.`
+    );
+  }
+
+  const phase = task.phase_id ? await PhaseService.getPhaseById(task.phase_id) : null;
+  const latestHandoff = await HandoffService.getLatestHandoff(taskId);
+
+  // 2. Measure baseline scaffolding tokens (Project/Phase/Task headers, section wrappers, and latest handoff)
+  const baselineScaffoldingText = renderCompiledContext({
+    project,
+    phase,
+    task,
+    packedMemories: [],
+    latestHandoff,
+  });
+  const scaffoldingTokens = tokenizer.encode(baselineScaffoldingText).length;
+
+  // 3. Option (a) Budget Calculation: Subtract scaffolding from totalTokenBudget before computing 80/20 split
+  const availableBudget = Math.max(0, totalTokenBudget - scaffoldingTokens);
+  const scratchpadReserveTokens = Math.floor(availableBudget * scratchpadReserveRatio);
+  const memoryTokenBudget = availableBudget - scratchpadReserveTokens;
+
+  // 4. Retrieve scored and ranked candidate memories (Item 3, HANDOFF excluded)
+  const candidates = await retrieveCandidateMemories(taskId, options);
+
+  // 5. Greedy token packing within memoryTokenBudget (Item 4)
+  const packingResult = packCandidateMemories(candidates, memoryTokenBudget, tokenizer);
+
+  // 6. Render final compiled context block
+  const compiledText = renderCompiledContext({
+    project,
+    phase,
+    task,
+    packedMemories: packingResult.packed,
+    latestHandoff,
+  });
+
+  const totalOutputTokens = tokenizer.encode(compiledText).length;
+
+  return {
+    compiledText,
+    task,
+    phase,
+    project,
+    latestHandoff,
+    budget: {
+      totalBudget: totalTokenBudget,
+      scaffoldingTokens,
+      scratchpadReserveTokens,
+      memoryBudget: memoryTokenBudget,
+      memoryTokensUsed: packingResult.tokensUsed,
+      memoryTokensRemaining: packingResult.tokensRemaining,
+      totalOutputTokens,
+    },
+    packedMemories: packingResult.packed,
+    skippedMemories: packingResult.skipped,
+  };
+}
+
+
 

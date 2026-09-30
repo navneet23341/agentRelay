@@ -5,6 +5,9 @@ import {
   scoreMemory,
   DEFAULT_DECAY_CONFIG,
   DEFAULT_SCORING_CONFIG,
+  renderCandidateMemory,
+  packCandidateMemories,
+  getCompiledContext,
 } from '../src/services/index.js';
 
 function runDecayTests() {
@@ -535,6 +538,32 @@ async function runCompilerRetrievalTests() {
     );
     console.log('  ✓ 1-hop causal parents successfully enriched on top-scored memories.');
 
+    // ------------------------------------------------------------------------
+    // 5. Test HANDOFF Memory Exclusion from Candidate Pool
+    // ------------------------------------------------------------------------
+    console.log('\n[Test 5/5] Testing HANDOFF exclusion from candidate retrieval...');
+    const targetHandoff = (
+      await MemoryService.createMemory({
+        type: 'HANDOFF',
+        content: '# Direct Task Handoff\n\n## Next Action\nProceed to next milestone.',
+        confidence_class: 'OBSERVED',
+        confidence_score: 1.0,
+        task_id: targetTask.id,
+      })
+    ).memory;
+
+    const refreshedCandidates = await retrieveCandidateMemories(targetTask.id);
+
+    assert.ok(
+      !refreshedCandidates.some((c) => c.type === 'HANDOFF'),
+      'No HANDOFF-type memory should ever enter the candidate memory pool'
+    );
+    assert.ok(
+      !refreshedCandidates.some((c) => c.id === targetHandoff.id),
+      'Target task handoff memory must be strictly excluded from candidate memories'
+    );
+    console.log('  ✓ HANDOFF memory strictly excluded from candidate retrieval pool.');
+
     console.log('\n======================================================');
     console.log('🎉 ALL STEP 3 COMPILER RETRIEVAL TESTS PASSED!');
     console.log('======================================================\n');
@@ -544,17 +573,473 @@ async function runCompilerRetrievalTests() {
       await query('DELETE FROM projects WHERE id = $1', [project.id]);
       console.log('  ✓ Test project cleaned up.');
     }
-    await closePool();
+  }
+}
+
+function runTokenPackingTests() {
+  console.log('=== Context Compiler Token Packing Tests (Chunk 6 - Step 4) ===\n');
+
+  // ------------------------------------------------------------------------
+  // 1. Shared Causal Parent Deduplication Test
+  // ------------------------------------------------------------------------
+  console.log('[Test 1/2] Testing shared causal parent deduplication across candidates...');
+
+  const sharedParent = {
+    id: 'mem-parent-1',
+    type: 'CHANGE' as const,
+    confidence_class: 'OBSERVED' as const,
+    confidence_score: 1.0,
+    status: 'ACTIVE' as const,
+    created_at: new Date('2026-09-20T10:00:00Z'),
+    last_seen_at: new Date('2026-09-20T10:00:00Z'),
+    task_id: 'task-1',
+    semantic_hash: null,
+    hit_count: 1,
+    causal_parents: [],
+    embedding: null,
+    invalidated_at: null,
+    invalidated_by: null,
+    superseded_by: null,
+    content: 'Updated Dockerfile base image to Alpine 3.20 without installing postgresql-contrib package.',
+    depth: 1,
+  };
+
+  const candA: any = {
+    id: 'mem-cand-A',
+    type: 'FAILURE' as const,
+    confidence_score: 0.95,
+    score: 1.4,
+    content: 'Migration 003 failed due to pgvector extension missing in container environment.',
+    causal_parents: [sharedParent.id],
+    causal_lineage: [sharedParent],
+    created_at: new Date('2026-09-20T11:00:00Z'),
+  };
+
+  const candB: any = {
+    id: 'mem-cand-B',
+    type: 'FAILURE' as const,
+    confidence_score: 0.90,
+    score: 1.2,
+    content: 'pg_dump backup job failed because pgvector types were not recognized by CLI tool.',
+    causal_parents: [sharedParent.id],
+    causal_lineage: [sharedParent],
+    created_at: new Date('2026-09-20T11:30:00Z'),
+  };
+
+  // Pack with sufficient budget (200 tokens)
+  const sharedParentResult = packCandidateMemories([candA, candB], 200);
+
+  assert.strictEqual(sharedParentResult.packed.length, 2, 'Both candidates must be packed');
+
+  // Candidate A (first encounter): full causal parent line rendered
+  assert.ok(
+    sharedParentResult.packed[0].rendered.includes(sharedParent.content),
+    'First candidate must render full causal parent content'
+  );
+  assert.ok(
+    sharedParentResult.packed[0].rendered.includes('↳ Caused by: [CHANGE] (Conf: 1.00):'),
+    'First candidate must include formatted parent header'
+  );
+
+  // Candidate B (subsequent encounter): terse reference rendered
+  assert.ok(
+    sharedParentResult.packed[1].rendered.includes('↳ Caused by: [CHANGE] (see above)'),
+    'Second candidate sharing parent must render terse reference "(see above)"'
+  );
+  assert.ok(
+    !sharedParentResult.packed[1].rendered.includes(sharedParent.content),
+    'Second candidate must NOT duplicate full causal parent content'
+  );
+
+  // Verify the shared parent content appears EXACTLY ONCE across the entire combined output
+  const combinedOutput = sharedParentResult.packed.map((p) => p.rendered).join('\n');
+  const parentContentOccurrences = combinedOutput.split(sharedParent.content).length - 1;
+  assert.strictEqual(
+    parentContentOccurrences,
+    1,
+    `Shared causal parent content must appear exactly once in final output, but appeared ${parentContentOccurrences} times`
+  );
+
+  // Verify token savings: Cand B token cost is smaller than Cand A
+  assert.ok(
+    sharedParentResult.packed[1].tokenCount < sharedParentResult.packed[0].tokenCount,
+    'Second candidate must consume fewer tokens due to causal parent deduplication'
+  );
+  console.log('  ✓ Shared causal parent rendered in full once and tersely referenced as "(see above)" on second candidate.');
+  console.log(`  ✓ Confirmed parent content appears exactly once across final output (saved ${sharedParentResult.packed[0].tokenCount - sharedParentResult.packed[1].tokenCount} tokens).`);
+
+  // ------------------------------------------------------------------------
+  // 2. Greedy Non-Halting Packing & Token-Counting Test (Fix 1 & Fix 2)
+  // ------------------------------------------------------------------------
+  console.log('\n[Test 2/2] Testing greedy non-halting scan with candidate skipping...');
+
+  const candidates: any[] = [
+    {
+      id: 'mem-1',
+      type: 'DECISION' as const,
+      confidence_score: 1.0,
+      score: 1.50,
+      content: 'Adopt PostgreSQL with pgvector for relational task state, vector embeddings, and causal lineage graphs instead of a separate graph DB.',
+      causal_lineage: [],
+      created_at: new Date('2026-09-20T10:00:00Z'),
+    },
+    {
+      id: 'mem-2',
+      type: 'FAILURE' as const,
+      confidence_score: 0.95,
+      score: 1.35,
+      content: 'Migration 003 failed due to pgvector extension missing in container environment.',
+      causal_lineage: [sharedParent],
+      created_at: new Date('2026-09-20T10:15:00Z'),
+    },
+    {
+      id: 'mem-3',
+      type: 'OBSERVATION' as const,
+      confidence_score: 0.80,
+      score: 1.15,
+      content: 'Significant database connection pool exhaustion observed during parallel integration test runner execution across 8 worker threads; recommend tuning max_connections from 10 to 30 and lowering idle connection timeout to prevent socket leaks.',
+      causal_lineage: [],
+      created_at: new Date('2026-09-20T10:30:00Z'),
+    },
+    {
+      id: 'mem-4',
+      type: 'CHANGE' as const,
+      confidence_score: 1.0,
+      score: 1.00,
+      content: 'Added composite index on memories(task_id, status, created_at).',
+      causal_lineage: [],
+      created_at: new Date('2026-09-20T10:45:00Z'),
+    },
+    {
+      id: 'mem-5',
+      type: 'DECISION' as const,
+      confidence_score: 1.0,
+      score: 0.90,
+      content: 'Use UTC timestamps across all database models.',
+      causal_lineage: [],
+      created_at: new Date('2026-09-20T11:00:00Z'),
+    },
+  ];
+
+  // Budget: 150 tokens
+  // mem-1 = 37 tokens (fits, rem=113)
+  // mem-2 = 62 tokens (fits, rem=51)
+  // mem-3 = 53 tokens (53 > 51 -> skipped!)
+  // mem-4 = 25 tokens (fits, rem=26)
+  // mem-5 = 21 tokens (fits, rem=5)
+  const result = packCandidateMemories(candidates, 150);
+
+  assert.strictEqual(result.tokensUsed, 145, `Tokens used must be 145, got ${result.tokensUsed}`);
+  assert.strictEqual(result.tokensRemaining, 5, `Tokens remaining must be 5, got ${result.tokensRemaining}`);
+  assert.deepStrictEqual(
+    result.packed.map((p) => p.memory.id),
+    ['mem-1', 'mem-2', 'mem-4', 'mem-5'],
+    'Must pack mem-1, mem-2, mem-4, and mem-5'
+  );
+  assert.strictEqual(result.skipped.length, 1, 'Exactly one candidate must be skipped');
+  assert.strictEqual(result.skipped[0].memory.id, 'mem-3', 'mem-3 must be the skipped candidate');
+  assert.ok(
+    result.skipped[0].reason.includes('Exceeds remaining budget'),
+    'Skipped reason must indicate budget exceeded'
+  );
+
+  console.log('  ✓ Greedy non-halting scan successfully skipped mem-3 (53 tokens > 51 remaining) and packed smaller mem-4 & mem-5.');
+
+  console.log('\n======================================================');
+  console.log('🎉 ALL STEP 4 TOKEN PACKING TESTS PASSED!');
+  console.log('======================================================\n');
+}
+
+async function runEndToEndCompilerTests() {
+  console.log('=== Context Compiler End-to-End Pipeline Tests (Chunk 6 - Step 5) ===\n');
+
+  const { closePool, query } = await import('../src/config/database.js');
+  const { ProjectModel } = await import('../src/models/index.js');
+  const { PhaseService, TaskService, MemoryService, HandoffService } = await import(
+    '../src/services/index.js'
+  );
+
+  let project: any;
+  try {
+    // ------------------------------------------------------------------------
+    // 1. Setup real project hierarchy
+    // ------------------------------------------------------------------------
+    project = await ProjectModel.create({
+      name: 'agentRelay Core (Chunk 6 E2E Test)',
+      goal: 'Continuity layer for autonomous coding agents',
+      constraints: 'PostgreSQL 16 with pgvector extension',
+      repository_ref: 'https://github.com/org/agentrelay',
+    });
+
+    const priorPhase = await PhaseService.createPhase({
+      project_id: project.id,
+      name: 'Phase 1: Base Container Scaffolding',
+      order_index: 1,
+      status: 'COMPLETED',
+    });
+
+    const priorTask = await TaskService.createTask({
+      project_id: project.id,
+      phase_id: priorPhase.id,
+      title: 'Initial Container Dockerfile Configuration',
+    });
+    await TaskService.updateTaskStatus(priorTask.id, 'IN_PROGRESS');
+    await TaskService.updateTaskStatus(priorTask.id, 'COMPLETED');
+
+    const phase = await PhaseService.createPhase({
+      project_id: project.id,
+      name: 'Phase 2: Context Compiler & Token Packing',
+      description: 'Greedy token-budget packing with decay, causal deduplication, and block rendering',
+      order_index: 2,
+      status: 'ACTIVE',
+    });
+
+    const targetTask = await TaskService.createTask({
+      project_id: project.id,
+      phase_id: phase.id,
+      title: 'Wire greedy token packer into getCompiledContext',
+      description: 'Ensure full rendered token cost counting and causal parent deduplication',
+    });
+    await TaskService.updateTaskStatus(targetTask.id, 'IN_PROGRESS');
+
+    const siblingTask = await TaskService.createTask({
+      project_id: project.id,
+      phase_id: phase.id,
+      title: 'Database connection pool optimization',
+    });
+    await TaskService.updateTaskStatus(siblingTask.id, 'IN_PROGRESS');
+    await TaskService.updateTaskStatus(siblingTask.id, 'BLOCKED');
+
+    // ------------------------------------------------------------------------
+    // 2. Create real memories in DB with causal parent relationships
+    // ------------------------------------------------------------------------
+    // Root causal change in prior phase (not in current phase candidate pool)
+    const rootChange = (
+      await MemoryService.createMemory({
+        type: 'CHANGE',
+        content: 'Updated Dockerfile base image to Alpine 3.20 without postgresql-contrib package.',
+        confidence_class: 'OBSERVED',
+        confidence_score: 1.0,
+        task_id: priorTask.id,
+      })
+    ).memory;
+
+    // Failure 1 (under target task) pointing to rootChange
+    const failure1 = (
+      await MemoryService.createMemory({
+        type: 'FAILURE',
+        content: 'Migration 003 failed: pgvector extension missing in alpine container environment.',
+        confidence_class: 'OBSERVED',
+        confidence_score: 1.0,
+        task_id: targetTask.id,
+        causal_parents: [rootChange.id],
+      })
+    ).memory;
+
+    // Failure 2 (under sibling blocked task) pointing to SAME rootChange
+    const failure2 = (
+      await MemoryService.createMemory({
+        type: 'FAILURE',
+        content: 'pg_dump backup job failed: pgvector data types unrecognized by client binaries.',
+        confidence_class: 'OBSERVED',
+        confidence_score: 0.95,
+        task_id: siblingTask.id,
+        causal_parents: [rootChange.id],
+      })
+    ).memory;
+
+    // Architectural Decision across phase
+    const decision1 = (
+      await MemoryService.createMemory({
+        type: 'DECISION',
+        content: 'Adopt PostgreSQL with pgvector for relational task state and vector embeddings instead of graph DB.',
+        confidence_class: 'OBSERVED',
+        confidence_score: 1.0,
+        task_id: targetTask.id,
+      })
+    ).memory;
+
+    // Recent change across phase
+    const change2 = (
+      await MemoryService.createMemory({
+        type: 'CHANGE',
+        content: 'Added composite B-Tree index on memories(task_id, status, created_at) to accelerate retrieval.',
+        confidence_class: 'OBSERVED',
+        confidence_score: 1.0,
+        task_id: targetTask.id,
+      })
+    ).memory;
+
+    // ------------------------------------------------------------------------
+    // 3. Create real task-scoped handoff record
+    // ------------------------------------------------------------------------
+    const handoffData = {
+      completedItems: [
+        'Implemented candidate memory scoring with exponential decay and hit_count boost',
+        'Implemented greedy non-halting candidate packing with cl100k_base tokenizer',
+      ],
+      remainingItems: [
+        'Expose getCompiledContext via MCP server tools in Chunk 7',
+        'Build CLI wrapper in Chunk 8',
+      ],
+      currentIssue: 'Ensure prompt tokens stay within tight context window budgets',
+      nextAction: 'Verify end-to-end context compilation and prepare MCP tool schemas',
+    };
+
+    await HandoffService.createHandoff(targetTask.id, handoffData);
+
+    // ------------------------------------------------------------------------
+    // 4. Execute getCompiledContext E2E pipeline
+    // ------------------------------------------------------------------------
+    console.log('[E2E Test] Executing getCompiledContext pipeline on target task...');
+    const result = await getCompiledContext(targetTask.id, {
+      totalTokenBudget: 600,
+      scratchpadReserveRatio: 0.20,
+    });
+
+    // ------------------------------------------------------------------------
+    // 5. Assertions on Budget (Option a: scaffolding subtracted first, then 80/20)
+    // ------------------------------------------------------------------------
+    console.log('[E2E Test] Validating Option (a) budget breakdown...');
+    assert.strictEqual(result.budget.totalBudget, 600, 'Total budget must be 600');
+    assert.ok(result.budget.scaffoldingTokens > 0, 'Scaffolding tokens must be positive');
+
+    const expectedAvailable = 600 - result.budget.scaffoldingTokens;
+    const expectedReserve = Math.floor(expectedAvailable * 0.20);
+    const expectedMemoryBudget = expectedAvailable - expectedReserve;
+
+    assert.strictEqual(
+      result.budget.scratchpadReserveTokens,
+      expectedReserve,
+      `Scratchpad reserve must be ${expectedReserve}`
+    );
+    assert.strictEqual(
+      result.budget.memoryBudget,
+      expectedMemoryBudget,
+      `Memory budget must be ${expectedMemoryBudget}`
+    );
+    assert.ok(
+      result.budget.memoryTokensUsed <= result.budget.memoryBudget,
+      'Memory tokens used must not exceed memory budget'
+    );
+    assert.strictEqual(
+      result.budget.memoryTokensRemaining,
+      expectedMemoryBudget - result.budget.memoryTokensUsed,
+      'Tokens remaining must match memory budget minus used'
+    );
+    assert.ok(
+      result.budget.totalOutputTokens <= 600,
+      'Total output tokens must stay strictly within total budget when budget is sufficient'
+    );
+    console.log(
+      `  ✓ Option (a) Budget verified: Total=600, Scaffolding=${result.budget.scaffoldingTokens}, Reserve(20%)=${result.budget.scratchpadReserveTokens}, MemoryBudget(80%)=${result.budget.memoryBudget}, Used=${result.budget.memoryTokensUsed}, OutputTokens=${result.budget.totalOutputTokens}`
+    );
+
+    // ------------------------------------------------------------------------
+    // 6. Assertions on Compiled Multi-Section Context Output
+    // ------------------------------------------------------------------------
+    console.log('\n[E2E Test] Validating block template sections and content...');
+    const text = result.compiledText;
+
+    // Check Section Headers
+    assert.ok(text.includes('# PROJECT: agentRelay Core (Chunk 6 E2E Test)'), 'Must include PROJECT section');
+    assert.ok(text.includes('Goal: Continuity layer for autonomous coding agents'), 'Must include Goal');
+    assert.ok(text.includes('Constraints: PostgreSQL 16 with pgvector extension'), 'Must include Constraints');
+    assert.ok(text.includes('## CURRENT PHASE: Phase 2: Context Compiler & Token Packing [ACTIVE]'), 'Must include CURRENT PHASE section');
+    assert.ok(text.includes('## CURRENT TASK: Wire greedy token packer into getCompiledContext [IN_PROGRESS]'), 'Must include CURRENT TASK section');
+    assert.ok(text.includes('## RELEVANT DECISIONS'), 'Must include RELEVANT DECISIONS section');
+    assert.ok(text.includes('## RELEVANT FAILURES'), 'Must include RELEVANT FAILURES section');
+    assert.ok(text.includes('## RECENT CHANGES'), 'Must include RECENT CHANGES section');
+    assert.ok(text.includes('## HANDOFF'), 'Must include HANDOFF section');
+    assert.ok(text.includes('## Completed Items'), 'Must include handoff completed items');
+    assert.ok(text.includes('## Remaining Items'), 'Must include handoff remaining items');
+    assert.ok(text.includes('## Next Action'), 'Must include handoff next action');
+    console.log('  ✓ All 7 required sections (PROJECT, CURRENT PHASE, CURRENT TASK, RELEVANT DECISIONS, RELEVANT FAILURES, RECENT CHANGES, HANDOFF) present.');
+
+    // ------------------------------------------------------------------------
+    // 7. Assertions on Shared Causal Parent Deduplication in Live Pipeline
+    // ------------------------------------------------------------------------
+    console.log('\n[E2E Test] Validating shared causal parent deduplication in compiled output...');
+    const parentMatches = text.split(rootChange.content).length - 1;
+    assert.strictEqual(
+      parentMatches,
+      1,
+      `Shared causal parent content must appear exactly once in the compiled output, found ${parentMatches}`
+    );
+    assert.ok(
+      text.includes('↳ Caused by: [CHANGE] (see above)'),
+      'Subsequent citation of shared parent must render terse reference "(see above)"'
+    );
+    console.log('  ✓ Shared causal parent rendered in full once and tersely referenced as "(see above)" for second citing failure.');
+
+    // ------------------------------------------------------------------------
+    // 8. Test Tiny Budget Overflow (Scaffolding exceeds totalTokenBudget)
+    // ------------------------------------------------------------------------
+    console.log('\n[E2E Test] Validating tiny totalTokenBudget overflow behavior...');
+    const tinyBudget = 50; // Headers + handoff is ~170 tokens, far exceeding 50
+    const tinyResult = await getCompiledContext(targetTask.id, {
+      totalTokenBudget: tinyBudget,
+      scratchpadReserveRatio: 0.20,
+    });
+
+    // Available budget clamps to 0
+    assert.strictEqual(tinyResult.budget.memoryBudget, 0, 'Memory budget must clamp to 0');
+    assert.strictEqual(tinyResult.budget.scratchpadReserveTokens, 0, 'Scratchpad reserve must be 0');
+    assert.strictEqual(tinyResult.budget.memoryTokensUsed, 0, 'No memory tokens used');
+    assert.strictEqual(tinyResult.packedMemories.length, 0, 'Zero memories packed');
+
+    // Surfaced honestly: totalOutputTokens exceeds totalBudget without being hidden or clamped
+    assert.ok(
+      tinyResult.budget.totalOutputTokens > tinyResult.budget.totalBudget,
+      `totalOutputTokens (${tinyResult.budget.totalOutputTokens}) must exceed totalBudget (${tinyResult.budget.totalBudget})`
+    );
+    assert.ok(
+      tinyResult.budget.scaffoldingTokens > tinyResult.budget.totalBudget,
+      `scaffoldingTokens (${tinyResult.budget.scaffoldingTokens}) must exceed totalBudget (${tinyResult.budget.totalBudget})`
+    );
+    assert.strictEqual(
+      tinyResult.budget.totalOutputTokens,
+      tinyResult.budget.scaffoldingTokens,
+      'When zero memories pack, total output tokens must equal scaffolding tokens'
+    );
+    console.log(
+      `  ✓ Correctly surfaced overflow honestly: TotalBudget=${tinyResult.budget.totalBudget}, Scaffolding=${tinyResult.budget.scaffoldingTokens}, OutputTokens=${tinyResult.budget.totalOutputTokens}, MemoryBudget=0, PackedCount=0.`
+    );
+
+    console.log('\n======================================================');
+    console.log('--- COMPILED CONTEXT OUTPUT PREVIEW ---');
+    console.log('======================================================');
+    console.log(text);
+    console.log('======================================================\n');
+
+    console.log('======================================================');
+    console.log('🎉 ALL STEP 5 END-TO-END CONTEXT COMPILER TESTS PASSED!');
+    console.log('======================================================\n');
+  } finally {
+    if (project) {
+      console.log('[Cleanup] Cleaning up E2E test project...');
+      await query('DELETE FROM projects WHERE id = $1', [project.id]);
+      console.log('  ✓ E2E test project cleaned up.');
+    }
   }
 }
 
 async function main() {
-  runDecayTests();
-  await runCompilerRetrievalTests();
+  const { closePool } = await import('../src/config/database.js');
+  try {
+    runDecayTests();
+    runTokenPackingTests();
+    await runCompilerRetrievalTests();
+    await runEndToEndCompilerTests();
+  } finally {
+    await closePool();
+  }
 }
 
 main().catch((err) => {
   console.error('Test failed:', err);
   process.exit(1);
 });
+
+
 
