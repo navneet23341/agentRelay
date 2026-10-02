@@ -1,0 +1,102 @@
+> agentrelay@0.1.0 benchmark
+> tsx scripts/simulate-multi-agent.ts
+
+================================================================
+🤖 agentRelay Multi-Agent Continuity & Benchmarking Suite (Chunk 9)
+================================================================
+
+--- Step 1: Agent A Initializes Workspace & Begins Task ---
+✓ Agent A started Task: "Implement robust partition rebalance & offset commit pipeline" [IN_PROGRESS] (ID: a3e5ae98-f7b5-442b-881b-51d3577466ac)
+
+--- Step 2: Agent A Executes, Encounters Errors, and Adapts ---
+  ✓ Recorded 3 architectural code changes.
+  ✓ Recorded initial decisions (including Decision 50ca4183).
+  ✓ Decision 50ca4183 atomically SUPERSEDED by Decision fd90c097.
+  ✓ Recorded failure linked to causal parent (Change: batch.size=65536).
+  ✓ Recorded performance observations.
+
+--- Step 3: Failure-Loop Stress Test (15 Identical Failures) ---
+  ✓ Verified failure-loop dedup: 15 identical failures collapsed into 1 row with hit_count = 15.
+
+--- Step 4: Agent A Reaches Context Limit, Creates Handoff, Cuts Off ---
+  ✓ Agent A saved structured Handoff memory.
+  ⚡ Agent A context window exhausted! Mid-task cutoff. Task remains [IN_PROGRESS].
+
+--- Step 5: Agent B Starts Cold & Compiles Context ---
+
+================================================================
+📄 AGENT B RECEIVED CONTEXT BLOCK:
+================================================================
+# PROJECT: Distributed Stream Ingestion Engine
+Goal: High-throughput Kafka streaming with partition rebalancing and zero data loss
+Constraints: Node.js 22, PostgreSQL 16 pgvector, Apache Kafka 3.7
+Repository: https://github.com/org/stream-engine
+
+## CURRENT PHASE: Phase 1: Consumer Group Architecture [ACTIVE]
+Description: Implement backpressure queueing, partition rebalancing, and offset management
+
+## CURRENT TASK: Implement robust partition rebalance & offset commit pipeline [IN_PROGRESS]
+Description: Prevent coordinator group eviction during intensive batch decompression
+
+## RELEVANT DECISIONS
+- [DECISION] (Conf: 1.00): Commit offsets directly to Kafka __consumer_offsets topic using synchronous commitSync with exponential retry; eliminated RocksDB cache due to partition reassignment desynchronization.
+  ↳ Caused by: [CHANGE] (Conf: 1.00): Configured partitioned consumer group with auto.offset.reset=earliest and session.timeout.ms=45000.
+- [DECISION] (Conf: 1.00): Use librdkafka C-bindings via kafkajs driver for high throughput partition commits.
+
+## RELEVANT FAILURES
+- [FAILURE] (Conf: 1.00): CommitFailedException: Broker coordinator dropped consumer group due to heartbeat timeout on rebalance. The group has rebalanced and assigned partitions to another member.
+- [FAILURE] (Conf: 1.00): OutOfMemoryError: Java heap space exhausted during large batch decompression under snappy codec.
+  ↳ Caused by: [CHANGE] (Conf: 1.00): Configured snappy compression and elevated batch.size=65536 on buffer producer.
+
+## RECENT CHANGES
+- [CHANGE] (Conf: 1.00): Increased max.poll.interval.ms to 300000 to prevent premature group eviction during batch processing.
+- [CHANGE] (Conf: 1.00): Configured snappy compression and elevated batch.size=65536 on buffer producer.
+- [CHANGE] (Conf: 1.00): Configured partitioned consumer group with auto.offset.reset=earliest and session.timeout.ms=45000.
+
+## RELEVANT OBSERVATIONS
+- [OBSERVATION] (Conf: 1.00): Network egress saturation observed on interface eth0 during uncompressed message fallback.
+- [OBSERVATION] (Conf: 1.00): Kafka consumer lag spiked to 45,000 messages during initial cluster rebalance phase.
+
+## HANDOFF
+# Task Handoff
+
+## Completed Items
+- [x] Configured partition consumer group with session.timeout.ms=45000
+- [x] Configured snappy compression and batch limits
+- [x] Switched from RocksDB local offset caching to direct Kafka __consumer_offsets commitSync
+- [x] Mitigated heartbeat coordinator timeout by raising max.poll.interval.ms to 300000
+
+## Remaining Items
+- [ ] Tune fetch.min.bytes for steady throughput under variable partition load
+- [ ] Add integration tests verifying consumer group recovery after network partition
+- [ ] Profile heap allocation under snappy decompression bursts
+
+## Current Issue
+Intermittent heap memory spikes during sudden 50k batch decompression bursts
+
+## Next Action
+Adjust snappy decompression buffer pool size and implement streaming payload chunks
+================================================================
+
+--- Step 6: Invariant & Correctness Checks ---
+  ✓ Stale-memory correctness: Superseded decision is 100% excluded; active decision is present.
+  ✓ Failure-loop correctness: 15-hit failure rendered exactly once.
+  ✓ Handoff correctness: Clear immediate next action delivered directly to Agent B.
+
+--- Step 7: Token Savings Benchmark Analysis ---
+┌─────────────────────────────────────────────────────────────┬──────────────┐
+│ Benchmark Metric                                            │ Value        │
+├─────────────────────────────────────────────────────────────┼──────────────┤
+│ Total Lifecycle Events Emitted by Agent A                   │ 25           │
+│ Naive Full History Token Count (Uncompiled)                 │ 1946         │
+│ agentRelay Compiled Context Token Count (Agent B Received)  │ 687          │
+│ Net Token Savings                                           │ 1259         │
+│ Token Context Window Reduction                              │ 64.7%        │
+│ Failure Loop Redundant Events Collapsed                     │ 15 -> 1      │
+│ Stale / Superseded Memories Filtered                        │ 1            │
+│ Budget Compliance (687 of 1200 tokens)                      │ 57.3%        │
+└─────────────────────────────────────────────────────────────┴──────────────┘
+
+================================================================
+🎉 MULTI-AGENT SIMULATION & BENCHMARK COMPLETE: 64.7% TOKEN REDUCTION
+================================================================

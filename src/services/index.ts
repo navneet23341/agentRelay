@@ -6,3 +6,5 @@ export * from './taskService.js';
 export * from './handoffService.js';
 export * from './embeddingService.js';
 export * from './contextCompiler.js';
+export * from './projectService.js';
+

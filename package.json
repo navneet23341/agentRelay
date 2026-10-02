@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "A continuity layer for coding agents",
   "main": "dist/src/server.js",
+  "bin": {
+    "relay": "./bin/relay.js"
+  },
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -17,9 +20,14 @@
     "test:reliability": "tsx scripts/test-memory-reliability.ts",
     "test:retrieval": "tsx scripts/test-retrieval.ts",
     "test:compiler": "tsx scripts/test-context-compiler.ts",
-    "test": "tsx scripts/verify-schema.ts && tsx scripts/test-memory-store.ts && tsx scripts/test-lifecycle.ts && tsx scripts/test-memory-reliability.ts && tsx scripts/test-retrieval.ts && tsx scripts/test-context-compiler.ts"
+    "test:mcp": "tsx scripts/test-mcp-integration.ts",
+    "test:cli": "tsx scripts/test-cli.ts",
+    "benchmark": "tsx scripts/simulate-multi-agent.ts",
+    "test": "tsx scripts/verify-schema.ts && tsx scripts/test-memory-store.ts && tsx scripts/test-lifecycle.ts && tsx scripts/test-memory-reliability.ts && tsx scripts/test-retrieval.ts && tsx scripts/test-context-compiler.ts && tsx scripts/test-mcp-integration.ts && tsx scripts/test-cli.ts && tsx scripts/simulate-multi-agent.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "commander": "^15.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
