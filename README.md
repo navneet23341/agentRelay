@@ -395,3 +395,47 @@ npm run benchmark         # Multi-agent simulation & token reduction benchmark
 ## 8. License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## 9. Real-World A/B Validation
+
+Beyond the synthetic benchmark above, I ran a real-world A/B test using
+two live coding agent sessions (OpenAI Codex CLI) building an identical
+multi-chunk backend project — once without agentRelay (baseline) and
+once with it connected via MCP.
+
+**Setup:** Agent A built Chunks 1-3 of a project in one condition, hit
+its session limit, and a fresh Agent B (new account, zero prior
+context) continued with Chunks 4-6. Repeated identically in the
+agentRelay condition, with agentRelay's MCP tools available to both
+agents.
+
+**Result: ~23% token reduction for Agent B's cold continuation**
+(108,127 tokens baseline vs. 82,954 tokens with agentRelay) for
+equivalent completed work — lower than the synthetic benchmark's 64.7%,
+which tracks: real repositories have messier signal than a scripted
+simulation, and this result reflects that honestly rather than
+re-running until the number looked better.
+
+**What I learned along the way (the useful part):**
+- agentRelay's value is real but *not automatic* — in testing, the
+  coding agent only reached for agentRelay's tools proactively when
+  explicitly told to in the prompt. Left alone, it defaulted to
+  re-reading source files, the same way it would without agentRelay at
+  all. This is a known pattern with MCP tool adoption generally, not
+  unique to this project, and the fix is onboarding, not architecture:
+  an `AGENTS.md` convention file in the repo (which Codex and similar
+  agents read automatically at session start) that tells the agent
+  this project uses agentRelay and when to call it. Next step on my
+  list.
+- Recording memories has a real token cost, not just a retrieval
+  benefit — the full picture is a trade: more expensive while an agent
+  is actively working and writing memories, cheaper when the next
+  agent picks up cold. Worth measuring both sides, not just the win.
+
+I'd rather ship a documented, honest 23% with a clear next step than a
+cherry-picked number — and figuring out *why* the real number differs
+from the synthetic one taught me more about agent tool adoption than
+the benchmark itself did.
+
